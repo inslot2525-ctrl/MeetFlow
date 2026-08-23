@@ -1,0 +1,10 @@
+Speaker A: Alright let's get started, we have a lot to cover today.
+Speaker B: Sure, should we start with the budget review?
+Speaker A: Yes. So we've decided to go with the AWS infrastructure over Azure.
+Speaker C: I still think Azure would have been cheaper in the long run.
+Speaker A: That decision is final. Rahul, can you set up the AWS account by Wednesday?
+Speaker B: I'll try to get to it this week.
+Speaker C: What about the data migration plan, has anyone looked into that?
+Speaker A: That's a good question, we haven't assigned that yet.
+Speaker B: Someone should probably handle that before the next sprint.
+Speaker A: Okay let's wrap up, good meeting everyone.
