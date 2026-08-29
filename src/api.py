@@ -56,24 +56,36 @@ def _heuristic_state(chunk: MeetingChunk) -> NotionDocumentState:
     # e.g. "Rahul, build the React frontend by Tuesday" or "Rahul can you set up the AWS account by Wednesday?"
     owner = None
     deadline = None
-    # Find owner — handle "Once X is done, Y ..." by taking name after comma
-    # e.g. "Once Rahul is done, Priya needs to connect the FastAPI"
+    # Find owner — handle multiple patterns
+    # 1. "Once X is done, Y needs..."
+    # 2. "assigning work to Rahul" -> Rahul
+    # 3. "Rahul, ..." start
     m_once_owner = re.search(r"once\s+\w+.*?[,\s]+([A-Z][a-z]+)\s+(?:needs|has|will|should|must|can)", text, re.I)
     if m_once_owner:
         owner = m_once_owner.group(1)
     else:
-        m_owner = re.match(r"\s*([A-Z][a-z]+)\b", text)
-        if m_owner and m_owner.group(1).lower() != "once":
-            owner = m_owner.group(1)
-        # fallback: find "@Name" or last capitalized name before verb
+        m_to = re.search(r"\bto\s+([A-Z][a-z]+)\b", text)
+        if m_to and m_to.group(1).lower() not in ("to", "the", "complete", "tomorrow"):
+            # verify it's a person name, not generic word
+            candidate = m_to.group(1)
+            if candidate[0].isupper() and candidate.lower() not in ("my", "your"):
+                owner = candidate
+        if not owner:
+            m_owner = re.match(r"\s*([A-Z][a-z]+)\b", text)
+            if m_owner and m_owner.group(1).lower() not in ("once", "this", "that", "it"):
+                owner = m_owner.group(1)
         if not owner:
             m_at = re.search(r"@(\w+)", text)
             if m_at:
                 owner = m_at.group(1)
-    # Find deadline
+    # Find deadline — also plain 'tomorrow' without 'by'
     m_dead = re.search(r"by\s+(Wednesday|Tuesday|Monday|Thursday|Friday|EOD|tomorrow|next sprint|next week|this week)", text, re.I)
     if m_dead:
         deadline = m_dead.group(1)
+    else:
+        m_dead2 = re.search(r"\b(tomorrow|today|EOD|next week|next sprint)\b", text, re.I)
+        if m_dead2:
+            deadline = m_dead2.group(1)
     # Depends on
     depends = None
     m_dep = re.search(r"once\s+(\w+).*?(?:is done|finished)", text, re.I)
@@ -82,12 +94,21 @@ def _heuristic_state(chunk: MeetingChunk) -> NotionDocumentState:
 
     # Extract task description — strip owner prefix and deadline suffix
     desc = text
-    # Remove leading "Once X is done, " clause for cleaner task text
+    # Remove leading "Once X is done, " clause
     desc = re.sub(r"^\s*once\s+\w+.*?done,\s*", "", desc, flags=re.I)
+    # For "this is Aditya I am assigning work to Rahul to complete..." extract the actionable part after "to Rahul"
+    m_action_part = re.search(r"\bto\s+" + re.escape(owner or "Rahul") + r"\b\s*(?:to\s*)?(.*)", desc, re.I) if owner else None
+    if m_action_part and owner and owner.lower() in desc.lower():
+        # Take text after "to Owner"
+        desc = m_action_part.group(1).strip()
     if owner:
         desc = re.sub(rf"^\s*{owner}[,\s]*", "", desc, flags=re.I)
         desc = re.sub(r"^\s*(can you|could you|please)\s*", "", desc, flags=re.I)
-    desc = re.sub(r"\s+by\s+\w+.*$", "", desc, flags=re.I).strip(" .")
+    # Clean filler prefix like "this is Aditya I am assigning work to..."
+    desc = re.sub(r"^\s*this is\s+\w+.*?assign\w*\s+work\s+to\s+\w+\s+to\s*", "", desc, flags=re.I)
+    desc = re.sub(r"^\s*assign\w*\s+work\s+to\s+\w+\s*", "", desc, flags=re.I)
+    desc = re.sub(r"\s+by\s+\w+.*$", "", desc, flags=re.I)
+    desc = re.sub(r"\s+tomorrow\s*$", "", desc, flags=re.I).strip(" .")
     if not desc:
         desc = text.strip()
 
@@ -110,7 +131,7 @@ def _heuristic_state(chunk: MeetingChunk) -> NotionDocumentState:
         owner = None
     is_actiony = label == "ACTION_ITEM"
     # Require imperative verb for task
-    has_action_verb = bool(re.search(r"\b(set up|build|connect|handle|create|migrate|review|prepare|send|write|fix|implement|deploy)\b", desc, re.I))
+    has_action_verb = bool(re.search(r"\b(set up|build|connect|handle|create|migrate|review|prepare|send|write|fix|implement|deploy|complete|certification|assign)\b", desc, re.I))
     if is_actiony and len(desc) > 5 and has_action_verb and not re.match(r"^(Alright|Sure|Yes|Okay|That|What about)", text, re.I):
         # Also dedupe by owner+desc
         exists = any(t.task_description.lower() == desc.lower() and (t.owner or "").lower() == (owner or "").lower() for t in tasks)
