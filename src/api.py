@@ -1,8 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 from .schema import MeetingChunk, NotionDocumentState, Task
 from .pipeline import predict_sentence_class
@@ -92,11 +92,15 @@ def _heuristic_state(chunk: MeetingChunk) -> NotionDocumentState:
         desc = text.strip()
 
     new_tasks: List[Task] = []
-    # Only create task if bouncer says action/decision and looks actionable
+    # Only create task if bouncer says action and looks actionable — DECISION alone is not a task
     label, _ = predict_sentence_class(text)
-    is_actiony = label in ("ACTION_ITEM", "DECISION")
-    # Also treat any sentence with owner+verb as task for demo
-    if is_actiony and len(desc) > 5 and not re.match(r"^(Alright|Sure|Yes|Okay|That|What about)", text, re.I):
+    # Ignore generic owner "We" — not a person task
+    if owner and owner.lower() in ("we", "once", "that"):
+        owner = None
+    is_actiony = label == "ACTION_ITEM"
+    # Require imperative verb for task
+    has_action_verb = bool(re.search(r"\b(set up|build|connect|handle|create|migrate|review|prepare|send|write|fix|implement|deploy)\b", desc, re.I))
+    if is_actiony and len(desc) > 5 and has_action_verb and not re.match(r"^(Alright|Sure|Yes|Okay|That|What about)", text, re.I):
         new_tasks.append(Task(task_description=desc, owner=owner, deadline=deadline, depends_on=depends))
         tasks.append(new_tasks[0])
 
@@ -209,3 +213,170 @@ async def parse_transcript_endpoint(payload: dict):
         tasks.extend(state.new_tasks)
         steps.append({"speaker": seg["speaker"], "text": seg["text"], "state": state.model_dump()})
     return {"steps": steps, "final_diagram": diagram, "tasks": [t.model_dump() for t in tasks]}
+
+
+# ---- Single-shot pipeline for validation: voice/file -> transcript -> summary/tasks/mermaid ----
+
+def _summarize_tasks(tasks: List[Task], transcript: str) -> str:
+    """Heuristic summary + Groq summary if available."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if api_key:
+        try:
+            from groq import Groq
+            client = Groq(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                messages=[
+                    {"role": "system", "content": "Summarize this meeting transcript into 3-5 concise bullet points. Focus on decisions and next steps."},
+                    {"role": "user", "content": transcript[:6000]},
+                ],
+                temperature=0.3,
+                max_tokens=400,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"[summarize] Groq failed, heuristic fallback: {e}")
+    # heuristic fallback
+    if not tasks:
+        return "No actionable tasks detected. " + transcript[:220]
+    bullets = [f"- {t.owner or 'Unassigned'}: {t.task_description} ({t.deadline or 'no deadline'})" for t in tasks]
+    return "Meeting summary (heuristic):\n" + "\n".join(bullets[:6])
+
+
+@app.post("/api/voice-to-mermaid")
+async def voice_to_mermaid(text: Optional[str] = Form(None), file: Optional[UploadFile] = File(None)):
+    """
+    Single-shot validation endpoint:
+    - Accepts either raw text (transcript) or audio file (wav/mp3/webm)
+    - Transcribes audio if provided (whisper if installed, else error)
+    - Runs batch pipeline: transcript -> persons/tasks -> mermaid -> summary
+    Returns {transcript, tasks, mermaid, summary, segments}
+    """
+    transcript = (text or "").strip()
+
+    # If audio file provided, transcribe it
+    if file is not None and file.filename:
+        content = await file.read()
+        if len(content) > 0:
+            # Try whisper → groq whisper → fallback
+            transcript_from_audio = None
+            # Try local whisper
+            try:
+                import tempfile, os as _os
+                suffix = _os.path.splitext(file.filename)[1] or ".webm"
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(content)
+                    tmp_path = tmp.name
+                # attempt faster_whisper / whisper
+                try:
+                    import whisper  # openai-whisper
+                    model = whisper.load_model("base")
+                    result = model.transcribe(tmp_path)
+                    transcript_from_audio = result.get("text", "").strip()
+                except ImportError:
+                    # try groq whisper if key exists
+                    groq_key = os.getenv("GROQ_API_KEY")
+                    if groq_key:
+                        from groq import Groq
+                        client = Groq(api_key=groq_key)
+                        with open(tmp_path, "rb") as f:
+                            tr = client.audio.transcriptions.create(model="whisper-large-v3", file=(file.filename, f))
+                            transcript_from_audio = tr.text
+                _os.unlink(tmp_path)
+            except Exception as e:
+                print(f"[voice] transcription failed: {e}")
+            if transcript_from_audio:
+                transcript = transcript_from_audio
+            elif not transcript:
+                transcript = ""  # will error below
+
+    if not transcript:
+        return {"error": "No transcript provided and audio transcription failed or not configured. Provide 'text' or install whisper / set GROQ_API_KEY."}
+
+    # Run batch pipeline similar to /api/parse-transcript but with richer summary
+    # If transcript has no speaker prefixes, treat each line/sentence as utterance
+    normalized = transcript
+    if ":" not in transcript:
+        # Split into sentences for pipeline
+        sentences = re.split(r"(?<=[.!?])\s+", transcript.strip())
+        normalized = "\n".join([f"Speaker {i+1}: {s.strip()}" for i, s in enumerate(sentences) if s.strip()])
+
+    # Reuse parse-transcript logic
+    from .parser import parse_transcript
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write(normalized)
+        fname = f.name
+    try:
+        segments = parse_transcript(fname)
+    finally:
+        os.unlink(fname)
+
+    diagram = "graph TD\n Start[Meeting Started]"
+    tasks: List[Task] = []
+    steps = []
+    summary_bullets: List[str] = []
+    for seg in segments:
+        chunk = MeetingChunk(new_spoken_text=seg["text"], current_diagram_code=diagram, current_tasks=tasks)
+        label, _ = predict_sentence_class(seg["text"])
+        if label in ("ACTION_ITEM", "DECISION"):
+            state = _groq_state(chunk)
+        else:
+            state = NotionDocumentState(new_tasks=[], updated_mermaid_diagram=diagram, meeting_summary_bullet=None)
+        diagram = state.updated_mermaid_diagram
+        tasks.extend(state.new_tasks)
+        if state.meeting_summary_bullet:
+            summary_bullets.append(state.meeting_summary_bullet)
+        steps.append({"speaker": seg["speaker"], "text": seg["text"], "label": label, "state": state.model_dump()})
+
+    summary = _summarize_tasks(tasks, transcript)
+    # Also include per-segment bullets as fallback
+    if summary_bullets and "heuristic" in summary.lower():
+        summary += "\n\nDecisions:\n- " + "\n- ".join(summary_bullets[:5])
+
+    return {
+        "transcript": transcript,
+        "segments": steps,
+        "tasks": [t.model_dump() for t in tasks],
+        "mermaid": diagram,
+        "summary": summary,
+    }
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    """Audio-only transcription endpoint — returns {transcript}."""
+    content = await file.read()
+    import tempfile
+    suffix = os.path.splitext(file.filename or "audio.webm")[1] or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    transcript = None
+    error = None
+    try:
+        try:
+            import whisper
+            model = whisper.load_model("base")
+            result = model.transcribe(tmp_path)
+            transcript = result.get("text", "").strip()
+        except ImportError as e:
+            groq_key = os.getenv("GROQ_API_KEY")
+            if groq_key:
+                from groq import Groq
+                client = Groq(api_key=groq_key)
+                with open(tmp_path, "rb") as f:
+                    tr = client.audio.transcriptions.create(model="whisper-large-v3", file=(file.filename or "audio.webm", f))
+                    transcript = tr.text
+            else:
+                error = f"whisper not installed and GROQ_API_KEY not set: {e}"
+        except Exception as e:
+            error = str(e)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+    if transcript:
+        return {"transcript": transcript}
+    return {"error": error or "Transcription failed", "transcript": ""}
