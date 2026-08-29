@@ -91,18 +91,32 @@ def _heuristic_state(chunk: MeetingChunk) -> NotionDocumentState:
     if not desc:
         desc = text.strip()
 
+    # Deduplicate: if same normalized text already seen, treat as filler
+    normalized_new = re.sub(r"\s+", " ", text.strip().lower())
+    for t in tasks:
+        if re.sub(r"\s+", " ", (t.task_description or "").lower()) == re.sub(r"\s+", " ", desc.lower()):
+            # already have this task, skip creation
+            return NotionDocumentState(
+                new_tasks=[],
+                updated_mermaid_diagram=_sanitize_mermaid(chunk.current_diagram_code),
+                meeting_summary_bullet=None,
+            )
+
     new_tasks: List[Task] = []
     # Only create task if bouncer says action and looks actionable — DECISION alone is not a task
     label, _ = predict_sentence_class(text)
     # Ignore generic owner "We" — not a person task
-    if owner and owner.lower() in ("we", "once", "that"):
+    if owner and owner.lower() in ("we", "once", "that", "it", "this"):
         owner = None
     is_actiony = label == "ACTION_ITEM"
     # Require imperative verb for task
     has_action_verb = bool(re.search(r"\b(set up|build|connect|handle|create|migrate|review|prepare|send|write|fix|implement|deploy)\b", desc, re.I))
     if is_actiony and len(desc) > 5 and has_action_verb and not re.match(r"^(Alright|Sure|Yes|Okay|That|What about)", text, re.I):
-        new_tasks.append(Task(task_description=desc, owner=owner, deadline=deadline, depends_on=depends))
-        tasks.append(new_tasks[0])
+        # Also dedupe by owner+desc
+        exists = any(t.task_description.lower() == desc.lower() and (t.owner or "").lower() == (owner or "").lower() for t in tasks)
+        if not exists:
+            new_tasks.append(Task(task_description=desc, owner=owner, deadline=deadline, depends_on=depends))
+            tasks.append(new_tasks[0])
 
     # Build mermaid: chain tasks in order, add dependency arrows if mentioned
     diagram = "graph TD\n Start[Meeting Started]"
