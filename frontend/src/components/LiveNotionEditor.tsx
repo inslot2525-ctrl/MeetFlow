@@ -13,6 +13,33 @@ const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 type Task = { task_description: string; owner?: string | null; deadline?: string | null };
 
+function VoiceBars({ stream }: { stream: MediaStream }) {
+  const [bars, setBars] = useState<number[]>(Array(12).fill(0));
+  const rafRef = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 64;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    const tick = () => {
+      (analyser as any).getByteFrequencyData(data);
+      setBars(Array.from({ length: 12 }, (_, i) => Math.min(1, (data[i * 2] || 0) / 140)));
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    tick();
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); try { src.disconnect(); analyser.disconnect(); ctx.close(); } catch {} };
+  }, [stream]);
+  return (
+    <div className="flex items-end gap-[3px] h-10 w-full justify-center">
+      {bars.map((v, i) => (
+        <div key={i} className="w-2 bg-cyan-400 rounded-full transition-all duration-75" style={{ height: `${8 + v * 32}px`, opacity: 0.6 + v * 0.4, boxShadow: v > 0.4 ? `0 0 8px hsl(180 100% 50% / ${v})` : undefined }} />
+      ))}
+    </div>
+  );
+}
+
 export default function LiveNotionEditor() {
   const [diagramCode, setDiagramCode] = useState<string>("graph TD\n Start[Meeting Started]");
   const diagramRef = useRef(diagramCode);
@@ -184,14 +211,17 @@ const [liveText, setLiveText] = useState("");
   return (
     <DarkGradientBg className="flex h-screen text-white overflow-hidden font-sans">
       {/* LEFT */}
-      <div className="w-[380px] shrink-0 flex flex-col border-r border-white/10 p-5 gap-4 overflow-hidden">
-        <div className="flex items-center gap-3">
-          <div className="w-16 h-16 shrink-0"><VoicePoweredOrb hue={180} voiceSensitivity={2.2} active={isListening} audioStream={micStream} /></div>
-          <div>
-            <h2 className="text-base font-bold text-cyan-400 leading-none">MeetFlow AI</h2>
-            <p className={`text-xs mt-1 ${isListening ? "text-green-400 animate-pulse" : "text-gray-500"}`}>{isListening ? "● Listening — transcript live" : "○ Mic off"}</p>
+      <div className="w-[380px] shrink-0 flex flex-col border-r border-white/10 p-5 gap-3 overflow-hidden">
+        {/* HERO VOICE SECTION - impossible to miss */}
+        <div className="bg-gradient-to-b from-cyan-500/10 to-transparent rounded-2xl border border-cyan-500/20 p-4 flex flex-col items-center gap-3">
+          <div className="w-28 h-28 shrink-0"><VoicePoweredOrb hue={180} voiceSensitivity={2.5} active={isListening} audioStream={micStream} /></div>
+          <div className="text-center">
+            <h2 className="text-lg font-bold text-cyan-400 leading-none">MeetFlow AI</h2>
+            <p className={`text-xs mt-1 font-semibold ${isListening ? "text-green-400 animate-pulse" : "text-gray-500"}`}>{isListening ? "● VOICE VISIBLE — speak now" : "○ Mic off — tap below"}</p>
           </div>
-          <button onClick={toggleMic} className={`ml-auto px-3.5 py-1.5 rounded-full text-xs font-bold border ${isListening ? "bg-red-500 border-red-500 text-white" : "bg-white text-black border-white"}`}>{isListening ? "Stop" : "Start Mic"}</button>
+          <button onClick={toggleMic} className={`w-full py-3.5 rounded-full text-sm font-black tracking-wide border-2 ${isListening ? "bg-red-500 border-red-500 text-white animate-pulse" : "bg-white border-white text-black hover:bg-gray-100"}`}>{isListening ? "⏹  STOP MIC" : "🎙  START MIC  —  SHOW MY VOICE"}</button>
+          {isListening && micStream && <VoiceBars stream={micStream} />}
+          {!isListening && <p className="text-[11px] text-gray-500 text-center">Grant mic permission — orb will pulse with your voice</p>}
         </div>
 
         <div className="flex gap-1 bg-black/40 rounded-full p-1 border border-white/10">
