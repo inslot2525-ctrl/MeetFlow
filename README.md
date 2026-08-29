@@ -12,10 +12,15 @@ MeetFlow/
 ├── test_install.py
 ├── data/
 │   └── sample_transcript.txt
-└── src/
-    ├── __init__.py
-    ├── parser.py
-    └── classifier.py
+├── src/
+│   ├── __init__.py
+│   ├── parser.py         # parse_transcript + TranscriptParser
+│   ├── classifier.py     # MeetingClassifier (DeBERTa wrapper)
+│   ├── pipeline.py       # predict_sentence_class bouncer
+│   ├── schema.py         # Task + NotionDocumentState + MeetingChunk
+│   └── api.py            # FastAPI /api/update-notion (stateful)
+└── frontend/             # Vite React + TipTap Live Notion Editor
+    └── src/components/LiveNotionEditor.tsx
 ```
 
 ## Setup
@@ -49,7 +54,25 @@ from src.classifier import MeetingClassifier
 parser = TranscriptParser()
 segments = parser.parse("path/to/transcript.txt")
 
-# Classify segments
+# Classify segments (bouncer)
 classifier = MeetingClassifier()
 results = classifier.classify(segments)
+```
+
+### Live Notion API (stateful flowchart)
+
+```bash
+# set Groq key for LLM (or heuristic fallback works offline)
+set GROQ_API_KEY=your_key
+py -m uvicorn src.api:app --reload --port 8000
+# POST /api/update-notion with {new_spoken_text, current_diagram_code, current_tasks}
+```
+
+### Frontend (TipTap headless)
+
+```bash
+cd frontend
+npm install
+npm run dev   # http://localhost:5173 proxies /api to :8000
+# LiveNotionEditor.tsx uses TipTap insertContent() to auto-drop tasks + mermaid roadmap
 ```

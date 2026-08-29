@@ -1,5 +1,13 @@
 from typing import List, Dict
 
+
+class TranscriptParser:
+    """Wrapper for backward-compat with test_install.py / README usage."""
+
+    def parse(self, file_path: str) -> List[Dict[str, str]]:
+        return parse_transcript(file_path)
+
+
 def parse_transcript(file_path: str) -> List[Dict[str, str]]:
     """
     Reads a transcript file and breaks it down into individual utterances.
