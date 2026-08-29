@@ -18,11 +18,12 @@ export default function LiveNotionEditor() {
   const diagramRef = useRef(diagramCode);
   const [currentTasks, setCurrentTasks] = useState<Task[]>([]);
   const tasksRef = useRef<Task[]>([]);
-  const [liveText, setLiveText] = useState("");
+const [liveText, setLiveText] = useState("");
   const [isListening, setIsListening] = useState(false);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [transcriptFeed, setTranscriptFeed] = useState<{ text: string; ts: string }[]>([]);
-  const [liveMode, setLiveMode] = useState<"transcript" | "full">("transcript"); // transcript-only is fast path
+  const [liveMode, setLiveMode] = useState<"transcript" | "full">("transcript");
+  const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const mermaidRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
@@ -30,6 +31,20 @@ export default function LiveNotionEditor() {
   useEffect(() => { diagramRef.current = diagramCode; }, [diagramCode]);
   useEffect(() => { tasksRef.current = currentTasks; }, [currentTasks]);
   useEffect(() => { feedEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [transcriptFeed, interimTranscript]);
+
+  // Cleanup mic stream on unmount or when listening stops
+  useEffect(() => {
+    return () => {
+      micStream?.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isListening && micStream) {
+      micStream.getTracks().forEach(t => t.stop());
+      setMicStream(null);
+    }
+  }, [isListening]);
 
   const editor = useEditor({
     extensions: [StarterKit, TaskList, TaskItem.configure({ nested: true })],
@@ -112,8 +127,8 @@ export default function LiveNotionEditor() {
     }
   };
 
-  // Web Speech API continuous
-  const toggleMic = () => {
+  // Web Speech API continuous + mic stream for orb
+  const toggleMic = async () => {
     const SR: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) {
       alert("Web Speech API not supported in this browser. Use Chrome/Edge, or type in the box.");
@@ -121,8 +136,17 @@ export default function LiveNotionEditor() {
     }
     if (isListening && recognitionRef.current) {
       recognitionRef.current.stop();
+      micStream?.getTracks().forEach(t => t.stop());
+      setMicStream(null);
       setIsListening(false);
       return;
+    }
+    // Get mic stream for visualizer
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      setMicStream(stream);
+    } catch (e) {
+      console.warn("Mic permission denied, orb will be static:", e);
     }
     const rec = new SR();
     rec.continuous = true;
@@ -162,7 +186,7 @@ export default function LiveNotionEditor() {
       {/* LEFT */}
       <div className="w-[380px] shrink-0 flex flex-col border-r border-white/10 p-5 gap-4 overflow-hidden">
         <div className="flex items-center gap-3">
-          <div className="w-12 h-12 shrink-0"><VoicePoweredOrb hue={180} voiceSensitivity={isListening ? 2.2 : 1.2} active={isListening} /></div>
+          <div className="w-16 h-16 shrink-0"><VoicePoweredOrb hue={180} voiceSensitivity={2.2} active={isListening} audioStream={micStream} /></div>
           <div>
             <h2 className="text-base font-bold text-cyan-400 leading-none">MeetFlow AI</h2>
             <p className={`text-xs mt-1 ${isListening ? "text-green-400 animate-pulse" : "text-gray-500"}`}>{isListening ? "● Listening — transcript live" : "○ Mic off"}</p>
