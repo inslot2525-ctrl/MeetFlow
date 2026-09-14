@@ -51,9 +51,11 @@ const [liveText, setLiveText] = useState("");
   const [transcriptFeed, setTranscriptFeed] = useState<{ text: string; ts: string }[]>([]);
   const [liveMode, setLiveMode] = useState<"transcript" | "full">("transcript");
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  const [recordingSec, setRecordingSec] = useState(0);
   const mermaidRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const feedEndRef = useRef<HTMLDivElement>(null);
+  const timerRef = useRef<number | null>(null);
 
   useEffect(() => { diagramRef.current = diagramCode; }, [diagramCode]);
   useEffect(() => { tasksRef.current = currentTasks; }, [currentTasks]);
@@ -71,6 +73,14 @@ const [liveText, setLiveText] = useState("");
       micStream.getTracks().forEach(t => t.stop());
       setMicStream(null);
     }
+    if (isListening) {
+      setRecordingSec(0);
+      timerRef.current = window.setInterval(() => setRecordingSec(s => s + 1), 1000);
+    } else {
+      if (timerRef.current) clearInterval(timerRef.current);
+      setInterimTranscript("");
+    }
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [isListening]);
 
   const editor = useEditor({
@@ -154,51 +164,66 @@ const [liveText, setLiveText] = useState("");
     }
   };
 
-  // Web Speech API continuous + mic stream for orb
+  // Web Speech API continuous + mic stream for orb — live transcripts while speaking
   const toggleMic = async () => {
     const SR: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (!SR) {
-      alert("Web Speech API not supported in this browser. Use Chrome/Edge, or type in the box.");
+      alert("Web Speech API not supported. Use Chrome/Edge on localhost/HTTPS.");
       return;
     }
     if (isListening && recognitionRef.current) {
-      recognitionRef.current.stop();
+      try { recognitionRef.current.stop(); } catch {}
       micStream?.getTracks().forEach(t => t.stop());
       setMicStream(null);
       setIsListening(false);
       return;
     }
-    // Get mic stream for visualizer
+    // Get mic stream for visualizer FIRST — shows recording instantly
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       setMicStream(stream);
-    } catch (e) {
-      console.warn("Mic permission denied, orb will be static:", e);
+    } catch (e: any) {
+      alert("Mic blocked: " + (e?.message || e) + " — allow microphone for this site.");
+      return;
     }
     const rec = new SR();
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = "en-US";
-    let finalBuffer = "";
+    rec.maxAlternatives = 1;
     rec.onresult = (event: any) => {
       let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const tr = event.results[i][0].transcript;
-        if (event.results[i].isFinal) finalBuffer += tr + " ";
-        else interim += tr;
+        const res = event.results[i];
+        const txt = res[0].transcript.trim();
+        if (!txt) continue;
+        if (res.isFinal) {
+          // Instant live transcript — push immediately, no buffering delay
+          sendToBackend(txt);
+          setInterimTranscript("");
+        } else {
+          interim += txt + " ";
+        }
       }
-      setInterimTranscript(interim);
-      // When we have a final sentence-ish, push it
-      if (finalBuffer.trim() && (finalBuffer.trim().endsWith(".") || finalBuffer.trim().split(" ").length > 8 || event.results[event.results.length-1]?.isFinal)) {
-        const toSend = finalBuffer.trim();
-        finalBuffer = "";
-        setInterimTranscript("");
-        sendToBackend(toSend);
+      setInterimTranscript(interim.trim());
+    };
+    rec.onend = () => {
+      // auto-restart while still listening (Chrome stops after ~30s)
+      if (isListening) {
+        try { rec.start(); } catch {}
       }
     };
-    rec.onend = () => { if (isListening) try { rec.start(); } catch {} };
-    rec.onerror = (e: any) => { console.error(e); setIsListening(false); };
-    try { rec.start(); recognitionRef.current = rec; setIsListening(true); } catch (e) { console.error(e); }
+    rec.onerror = (e: any) => {
+      console.error("Speech error", e);
+      if (e.error === "not-allowed") {
+        alert("Microphone permission denied.");
+        setIsListening(false);
+        stream?.getTracks().forEach(t => t.stop());
+        setMicStream(null);
+      }
+    };
+    try { rec.start(); recognitionRef.current = rec; setIsListening(true); } catch (e) { console.error(e); stream?.getTracks().forEach(t => t.stop()); setMicStream(null); }
   };
 
   useEffect(() => { return () => { try { recognitionRef.current?.stop(); } catch {} }; }, []);
@@ -221,16 +246,21 @@ const [liveText, setLiveText] = useState("");
     <DarkGradientBg className="flex h-screen text-white overflow-hidden font-sans">
       {/* LEFT */}
       <div className="w-[380px] shrink-0 flex flex-col border-r border-white/10 p-5 gap-3 overflow-hidden">
-        {/* HERO VOICE SECTION - impossible to miss */}
+        {/* HERO VOICE SECTION - live recording + instant transcript */}
         <div className="bg-gradient-to-b from-cyan-500/10 to-transparent rounded-2xl border border-cyan-500/20 p-4 flex flex-col items-center gap-3">
-          <div className="w-28 h-28 shrink-0"><VoicePoweredOrb hue={180} voiceSensitivity={2.5} active={isListening} audioStream={micStream} /></div>
+          <div className="w-28 h-28 shrink-0 relative">
+            <VoicePoweredOrb hue={180} voiceSensitivity={2.5} active={isListening} audioStream={micStream} />
+            {isListening && <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full animate-ping" />}
+            {isListening && <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full" />}
+          </div>
           <div className="text-center">
             <h2 className="text-lg font-bold text-cyan-400 leading-none">MeetFlow AI</h2>
-            <p className={`text-xs mt-1 font-semibold ${isListening ? "text-green-400 animate-pulse" : "text-gray-500"}`}>{isListening ? "● VOICE VISIBLE — speak now" : "○ Mic off — tap below"}</p>
+            <p className={`text-xs mt-1 font-mono font-semibold ${isListening ? "text-green-400" : "text-gray-500"}`}>{isListening ? `● REC ${String(Math.floor(recordingSec/60)).padStart(2,"0")}:${String(recordingSec%60).padStart(2,"0")} — speaking → transcripts live` : "○ Mic off — tap to record"}</p>
           </div>
-          <button onClick={toggleMic} className={`w-full py-3.5 rounded-full text-sm font-black tracking-wide border-2 ${isListening ? "bg-red-500 border-red-500 text-white animate-pulse" : "bg-white border-white text-black hover:bg-gray-100"}`}>{isListening ? "⏹  STOP MIC" : "🎙  START MIC  —  SHOW MY VOICE"}</button>
+          <button onClick={toggleMic} className={`w-full py-3.5 rounded-full text-sm font-black tracking-wide border-2 transition-all ${isListening ? "bg-red-500 border-red-500 text-white animate-pulse shadow-[0_0_20px_rgba(239,68,68,0.5)]" : "bg-white border-white text-black hover:bg-gray-100"}`}>{isListening ? "⏹  STOP RECORDING" : "🎙  START RECORDING"}</button>
           {isListening && micStream && <VoiceBars stream={micStream} />}
-          {!isListening && <p className="text-[11px] text-gray-500 text-center">Grant mic permission — orb will pulse with your voice</p>}
+          {isListening && <p className="text-[10px] text-cyan-300/70 text-center animate-pulse">Recording… speak and watch transcript appear below instantly</p>}
+          {!isListening && <p className="text-[11px] text-gray-500 text-center">Allow mic — orb + bars will dance with your voice</p>}
         </div>
 
         <div className="flex gap-1 bg-black/40 rounded-full p-1 border border-white/10">
@@ -248,10 +278,10 @@ const [liveText, setLiveText] = useState("");
           <button onClick={()=>{sendToBackend(liveText); setLiveText("");}} className="bg-white text-black px-4 rounded-full text-xs font-bold">Send</button>
         </div>
 
-        {/* Interim transcript */}
-        {(interimTranscript || isListening) && (
-          <div className="bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 text-xs text-cyan-100 min-h-[36px]">{interimTranscript || <span className="text-cyan-300/60">Listening… speak now</span>}</div>
-        )}
+        {/* Interim transcript — LIVE while speaking */}
+        <div className={`rounded-xl px-3 py-2.5 text-xs min-h-[44px] border transition-all ${isListening ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-100" : "bg-white/[0.04] border-white/10 text-gray-500"}`}>
+          {isListening ? (interimTranscript ? <><span className="text-cyan-400 font-bold">● </span>{interimTranscript}<span className="inline-block w-2 h-3 bg-cyan-400 ml-1 animate-pulse" /></> : <span className="text-cyan-300/60">Speaking… interim transcript appears here live</span>) : <span>Transcript pauses when mic is off</span>}
+        </div>
 
         {/* Live transcript feed */}
         <div className="flex-1 bg-black/30 rounded-xl border border-white/10 flex flex-col overflow-hidden">
